@@ -1,0 +1,98 @@
+name: Upstream Sync + Continuation Patch
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-sync-patch-dev
+  cancel-in-progress: false
+
+jobs:
+  sync-and-patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync dev with upstream/dev
+        run: |
+          set -euo pipefail
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream https://github.com/code-yeongyu/oh-my-openagent.git
+          else
+            git remote add upstream https://github.com/code-yeongyu/oh-my-openagent.git
+          fi
+
+          git fetch --no-tags origin dev
+          git fetch --no-tags upstream dev
+
+          git checkout dev
+          git reset --hard origin/dev
+
+          git merge -X theirs --no-edit upstream/dev
+
+      - name: Reapply continuation fallback patch (idempotent)
+        run: bun run script/apply-continuation-fallback-patch.ts
+
+      - name: Detect pending push
+        id: detect
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet; then
+            echo "dirty=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "dirty=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          ahead=$(git rev-list --count origin/dev..HEAD)
+          echo "ahead=${ahead}" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        if: steps.detect.outputs.dirty == 'true' || steps.detect.outputs.ahead != '0'
+        run: bun install
+        env:
+          BUN_INSTALL_ALLOW_SCRIPTS: "@ast-grep/napi"
+
+      - name: Validate continuation hook patch
+        if: steps.detect.outputs.dirty == 'true' || steps.detect.outputs.ahead != '0'
+        run: |
+          bun test src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
+          bun run typecheck
+
+      - name: Commit patch changes when needed
+        if: steps.detect.outputs.dirty == 'true'
+        run: |
+          git add src/hooks/todo-continuation-enforcer/continuation-injection.ts
+          git add src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
+          git commit -m "fix: reapply continuation fallback patch after upstream sync"
+
+      - name: Push updates to origin/dev
+        if: steps.detect.outputs.dirty == 'true' || steps.detect.outputs.ahead != '0'
+        run: |
+          set -euo pipefail
+
+          ahead=$(git rev-list --count origin/dev..HEAD)
+          if [ "$ahead" = "0" ]; then
+            echo "No commits to push"
+            exit 0
+          fi
+
+          git push origin dev
