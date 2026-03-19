@@ -1,0 +1,205 @@
+name: Upstream Sync + Patch + Publish
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: upstream-sync-patch
+  cancel-in-progress: false
+
+jobs:
+  sync-patch-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream and check for changes
+        id: check
+        run: |
+          set -euo pipefail
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream https://github.com/code-yeongyu/oh-my-openagent.git
+          else
+            git remote add upstream https://github.com/code-yeongyu/oh-my-openagent.git
+          fi
+
+          git fetch --no-tags upstream dev
+          git fetch --tags upstream
+          git fetch --no-tags origin dev
+
+          UPSTREAM_SHA=$(git rev-parse upstream/dev)
+          ORIGIN_SHA=$(git rev-parse origin/dev)
+
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          echo "origin_sha=${ORIGIN_SHA}" >> "$GITHUB_OUTPUT"
+
+          # Check if fork has our sync tag matching upstream SHA
+          LAST_SYNCED=$(git tag -l "synced/*" --sort=-version:refname | head -1)
+          LAST_SYNCED_SHA=""
+          if [ -n "$LAST_SYNCED" ]; then
+            LAST_SYNCED_SHA=$(echo "$LAST_SYNCED" | sed 's|synced/||')
+          fi
+
+          if [ "$UPSTREAM_SHA" = "$LAST_SYNCED_SHA" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Already synced to upstream $UPSTREAM_SHA"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "New upstream: $UPSTREAM_SHA (was: $LAST_SYNCED_SHA)"
+          fi
+
+          # Get upstream version from package.json
+          UPSTREAM_VERSION=$(git show upstream/dev:package.json | python3 -c "import sys,json; print(json.load(sys.stdin)['version'])")
+          echo "upstream_version=${UPSTREAM_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Upstream version: $UPSTREAM_VERSION"
+
+      - name: Preserve fork-only files
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/fork-overlay/.github/workflows
+          mkdir -p /tmp/fork-overlay/script
+
+          cp .github/workflows/upstream-sync-patch.yml /tmp/fork-overlay/.github/workflows/
+          cp script/apply-continuation-fallback-patch.ts /tmp/fork-overlay/script/
+
+      - name: Hard-reset to upstream dev
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          git checkout dev
+          git reset --hard upstream/dev
+
+      - name: Overlay fork-only files
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          cp /tmp/fork-overlay/.github/workflows/upstream-sync-patch.yml .github/workflows/
+          cp /tmp/fork-overlay/script/apply-continuation-fallback-patch.ts script/
+
+          git add .github/workflows/upstream-sync-patch.yml script/apply-continuation-fallback-patch.ts
+          git commit -m "chore: preserve fork automation files"
+
+      - uses: oven-sh/setup-bun@v2
+        if: steps.check.outputs.skip != 'true'
+        with:
+          bun-version: latest
+
+      - name: Reapply continuation fallback patch (idempotent)
+        if: steps.check.outputs.skip != 'true'
+        run: bun run script/apply-continuation-fallback-patch.ts
+
+      - name: Commit patch
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          if ! git diff --quiet; then
+            git add -A
+            git commit -m "fix: reapply continuation fallback patch"
+          fi
+
+      - name: Install dependencies
+        if: steps.check.outputs.skip != 'true'
+        run: bun install
+        env:
+          BUN_INSTALL_ALLOW_SCRIPTS: "@ast-grep/napi"
+
+      - name: Validate patch
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          bun test src/hooks/todo-continuation-enforcer/todo-continuation-enforcer.test.ts
+          bun run typecheck
+
+      - name: Set fork version
+        if: steps.check.outputs.skip != 'true'
+        id: version
+        run: |
+          set -euo pipefail
+
+          # Use latest upstream release tag version (more accurate than dev package.json)
+          RELEASE_VERSION=$(git tag -l 'v*' --sort=-version:refname | head -1 | sed 's/^v//')
+          PKG_VERSION="${{ steps.check.outputs.upstream_version }}"
+
+          # Pick whichever is newer
+          if [ -n "$RELEASE_VERSION" ]; then
+            UPSTREAM_VERSION="$RELEASE_VERSION"
+          else
+            UPSTREAM_VERSION="$PKG_VERSION"
+          fi
+
+          SHORT_SHA=$(echo "${{ steps.check.outputs.upstream_sha }}" | cut -c1-7)
+          FORK_VERSION="${UPSTREAM_VERSION}-templarsco.${SHORT_SHA}"
+          echo "fork_version=${FORK_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Fork version: $FORK_VERSION (release=$RELEASE_VERSION pkg=$PKG_VERSION)"
+
+          jq --arg v "$FORK_VERSION" '.version = $v' package.json > tmp.json && mv tmp.json package.json
+          jq --arg n "@templarsco/oh-my-opencode" '.name = $n' package.json > tmp.json && mv tmp.json package.json
+
+          git add package.json
+          git commit -m "chore: set fork version $FORK_VERSION"
+
+      - name: Build
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          bun build src/index.ts --outdir dist --target bun --format esm --external @ast-grep/napi
+          bun build src/cli/index.ts --outdir dist/cli --target bun --format esm --external @ast-grep/napi
+          bunx tsc --emitDeclarationOnly
+          bun run build:schema
+
+      - name: Force-push synced dev
+        if: steps.check.outputs.skip != 'true'
+        run: git push --force-with-lease origin dev
+
+      - uses: actions/setup-node@v4
+        if: steps.check.outputs.skip != 'true'
+        with:
+          node-version: "24"
+          registry-url: "https://npm.pkg.github.com"
+          scope: "@templarsco"
+
+      - name: Publish to GitHub Packages
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          OUTPUT=$(npm publish --access public --tag templarsco 2>&1) && echo "$OUTPUT" || {
+            if echo "$OUTPUT" | grep -q "Cannot publish over existing version"; then
+              echo "Version already published — skipping (idempotent)"
+            else
+              echo "$OUTPUT" >&2
+              exit 1
+            fi
+          }
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          VERSION="${{ steps.version.outputs.fork_version }}"
+          UPSTREAM_SHA="${{ steps.check.outputs.upstream_sha }}"
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --notes "Synced to upstream [code-yeongyu/oh-my-openagent@${UPSTREAM_SHA:0:7}](https://github.com/code-yeongyu/oh-my-openagent/commit/${UPSTREAM_SHA}) with continuation fallback patch applied." \
+            --target dev \
+            2>/dev/null || echo "Release v${VERSION} already exists"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag sync checkpoint
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          git tag "synced/${{ steps.check.outputs.upstream_sha }}"
+          git push origin "synced/${{ steps.check.outputs.upstream_sha }}" || true
