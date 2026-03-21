@@ -1775,4 +1775,79 @@ describe("todo-continuation-enforcer", () => {
     expect(promptCalls).toHaveLength(0)
   })
 
+
+  test("should fallback to prompt when promptAsync fails with timeout-like error", async () => {
+    // given - session where promptAsync fails transiently
+    const sessionID = "main-prompt-fallback-timeout"
+    setMainSession(sessionID)
+    const mockInput = createMockPluginInput()
+    let asyncCallCount = 0
+    mockInput.client.session.promptAsync = async (opts: PromptRequestOptions) => {
+      asyncCallCount += 1
+      promptCalls.push({
+        sessionID: opts.path.id,
+        agent: opts.body.agent,
+        model: opts.body.model,
+        text: opts.body.parts[0].text,
+      })
+      throw new Error("Send failed: upstream timeout (524)")
+    }
+
+    const hook = createTodoContinuationEnforcer(mockInput, {})
+
+    // when - session goes idle
+    await hook.handler({
+      event: { type: "session.idle", properties: { sessionID } },
+    })
+    await fakeTimers.advanceBy(2500, true)
+
+    // then - fallback prompt succeeded after promptAsync failure
+    expect(asyncCallCount).toBe(1)
+    expect(promptCalls).toHaveLength(2)
+  })
+
+  test("should not fallback to prompt on non-transient promptAsync error", async () => {
+    // given - session where promptAsync fails with non-retriable error
+    const sessionID = "main-prompt-no-fallback"
+    setMainSession(sessionID)
+    const mockInput = createMockPluginInput()
+    let asyncCallCount = 0
+    let promptCallCount = 0
+
+    mockInput.client.session.prompt = async (opts: PromptRequestOptions) => {
+      promptCallCount += 1
+      promptCalls.push({
+        sessionID: opts.path.id,
+        agent: opts.body.agent,
+        model: opts.body.model,
+        text: opts.body.parts[0].text,
+      })
+      return {}
+    }
+
+    mockInput.client.session.promptAsync = async (opts: PromptRequestOptions) => {
+      asyncCallCount += 1
+      promptCalls.push({
+        sessionID: opts.path.id,
+        agent: opts.body.agent,
+        model: opts.body.model,
+        text: opts.body.parts[0].text,
+      })
+      throw new Error("simulated auth failure")
+    }
+
+    const hook = createTodoContinuationEnforcer(mockInput, {})
+
+    // when - session goes idle
+    await hook.handler({
+      event: { type: "session.idle", properties: { sessionID } },
+    })
+    await fakeTimers.advanceBy(2500, true)
+
+    // then - no fallback used, failure path preserved
+    expect(asyncCallCount).toBe(1)
+    expect(promptCallCount).toBe(0)
+    expect(promptCalls).toHaveLength(1)
+  })
+
 })
