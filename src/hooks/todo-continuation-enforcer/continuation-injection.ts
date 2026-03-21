@@ -36,6 +36,17 @@ function hasWritePermission(tools: Record<string, ToolPermission> | undefined): 
   )
 }
 
+function shouldRetryWithPrompt(error: unknown): boolean {
+  if (!error) return false
+  const message = String(error).toLowerCase()
+  return (
+    message.includes("timeout") ||
+    message.includes("timed out") ||
+    message.includes("524") ||
+    message.includes("send failed")
+  )
+}
+
 export async function injectContinuation(args: {
   ctx: PluginInput
   sessionID: string
@@ -158,8 +169,7 @@ ${todoList}`
     })
 
     const inheritedTools = resolveInheritedPromptTools(sessionID, tools)
-
-    await ctx.client.session.promptAsync({
+    const promptBody = {
       path: { id: sessionID },
       body: {
         agent: agentName,
@@ -168,8 +178,24 @@ ${todoList}`
         parts: [createInternalAgentTextPart(prompt)],
       },
       query: { directory: ctx.directory },
-    })
+    }
 
+    if (typeof ctx.client.session.promptAsync === "function") {
+      try {
+        await ctx.client.session.promptAsync(promptBody)
+      } catch (error) {
+        if (!shouldRetryWithPrompt(error)) {
+          throw error
+        }
+        log(`[${HOOK_NAME}] promptAsync failed, retrying with prompt`, {
+          sessionID,
+          error: String(error),
+        })
+        await ctx.client.session.prompt(promptBody)
+      }
+    } else {
+      await ctx.client.session.prompt(promptBody)
+    }
     log(`[${HOOK_NAME}] Injection successful`, { sessionID })
     if (injectionState) {
       injectionState.inFlight = false
