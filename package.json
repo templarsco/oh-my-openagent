@@ -1,6 +1,6 @@
 {
-  "name": "oh-my-opencode",
-  "version": "3.11.0",
+  "name": "@templarsco/oh-my-opencode",
+  "version": "3.12.3-templarsco.500784a",
   "description": "The Best AI Agent Harness - Batteries-Included OpenCode Plugin with Multi-Model Orchestration, Parallel Background Agents, and Crafted LSP/AST Tools",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
